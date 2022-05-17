@@ -25,3 +25,38 @@
    2. 开始第二次循环，此时只会走到else分支，else分支代表已经有队列的情况。这里的做法和addWaiter插入节点一样，也会出现尾分叉的情况。
    3. 最巧妙的来了，出现尾分叉代表当前线程的节点插入队列失败了，此时是不会走到return t;这段代码，for循环仍未结束，这时候就会开启第3次循环。
    4. 结合代码可以看到，第3次循环还是会走2.的步骤，再次CAS插入队尾，失败了再次循环，一直反复下去，直到成功插入到队尾，结束循环。当所有线程结束了enq方法后，AQS就不会再有尾分叉的情况。
+   
+5. 拿锁失败了，这时候该乖乖挂起等待唤醒了吧？但这一步之前还要做一个操作：自己现在还能不能挂起。首先需要明确一件事：只有前驱节点的waitStatus = SIGNAL，才能挂载它后面，因为自己睡着后是不会自然醒的，需要prev来唤醒自己，而SIGNAL则表示prev可以唤醒自己。在shouldParkAfterFailedAcquire里是怎么做的呢？第一步直接判断prev是否为SIGNAL，是的话直接返回true给上层，告诉上层我可以被挂起了。如果不是的话有两种情况：prev已经取消(1)，prev还在等锁(0)。如果是后者，直接CAS将prev的ws设为SIGNAL。如果prev已取消了，那可不能跟在它后面，毕竟它逻辑上已经不属于队列的一份子了，此时通过while循环挂载到离自己最近的、ws<=0的节点上，到了下一次acquireQueued循环的时候，就会直接将prev的ws设为SIGNAL。此时自己就能够挂起了，调用parkAndCheckInterrupt()，最终线程会停在LockSupport.park(this)这里。
+
+6. head节点的状态：
+   0：拿到锁后，没有后继节点
+   -1：拿到锁后，有后继节点
+   0：释放锁后，将自己的ws改为0
+   head是由队列中上一次拿到锁的节点转换而来的（被非公平抢夺后不算），当队列节点拿到锁后，除了将exclusiveOwnerThread设为自己，还要将head里的thread设为null，充当哑节点。
+
+   有以下队列：
+   head(-1) ↔ node1(-1) ↔ node2(-1) ↔ node3(<=0)
+   此时node1和node2都是挂起状态，node1等待head唤醒
+
+   过了一段时间后，node1取消拿锁，状态变为cancel
+   head(-1) ↔ node1(1) ↔ node2(-1) ↔ node3(<=0)
+
+   此时持锁线程释放锁，将head的ws改为0，发现head的next是cancel状态的，于是从tail(node3)开始向前遍历，找到距离最近的、ws<=0的节点，即node2，然后唤醒它：
+
+   head(0) ↔ node1(1) ↔ node2(我醒了！！) ↔ node3(<=0)
+
+   此时node2就从parkAndCheckInterrupt()方法里醒来了，继续参与acquireQueued()的循环。
+   但是！！！注意看此时的链表，node2仍挂载在node1后面，node1可不是head，所以node2就算醒来了，在acquireQueued里还是不会命中p == head这个条件，所以还是会走进shouldParkAfterFailedAcquire()
+
+   可是node2明明被唤醒了啊，按道理该去拿锁，别急，都是因为node1取消了，node2才要这么麻烦多走一步，AQS会再判断一下node2是否应该被挂起。在shouldParkAfterFailedAcquire里，会根据node1的ws判断走进ws>0的代码块，这一步就是让node2不停地向前遍历，找到一个ws<=0的head挂载，此时就能找到head了：
+
+     					node1(1) 
+      	↙				↓
+
+   head(0)  ↔ node2(我醒了！！) ↔ node3(<=0)
+
+   这样整个链表在逻辑上就没有了node1，而node1也会被GC回收掉。
+
+   好，此时shouldParkAfterFailedAcquire返回，回到acquireQueued的循环语句，这时候node2的prev就必定是head了（毕竟node2是被head选出来，离自己最近的，现在又挂载到自己后面了），这时候就去拿锁，公平锁的情况下必定是成功的，接着就是将自己设为head，设exclusiveOwnerThread，弹出旧head等常规操作。
+
+   此时非公平拿锁呢？队外线程在入队前会拿2次锁，如果队外线程得逞了，head节点依旧不变，只是将exclusiveOwnerThread设为自己而已，那node2发现自己失败了，会又灰溜溜地走进shouldParkAfterFailedAcquire里2次，第1次将head的ws设为-1，第2次直接返回true，然后挂载自己，等待这个队外线程唤醒自己，唤醒后的node2流程也是一样的。
